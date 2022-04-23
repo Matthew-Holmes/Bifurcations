@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import copy
 import itertools
+import tqdm
 
 def latexify(x):
     out = '$' + x + '$'
@@ -101,8 +102,6 @@ class ExpressionBlock:
         # second half
         # loop over each term in the sum
         for i in range(1,self.k + 1):
-            # ktuple = (gamma, k)
-            # indexing starts from 0
             if self.p_dict[i] == 0:
                 # differentiating id --> zeros out
                 continue 
@@ -163,7 +162,7 @@ class SymbolicXYTensor():
             self.x_dim = x_dim
             self.y_dim = y_dim
             self.xy_order = xy_order
-            self.data = pd.DataFrame
+            self.data = pd.DataFrame()
             
             # the sets from which we draw the possible multi-indices
             x_dims = list(range(1, x_dim+1)) 
@@ -188,7 +187,7 @@ class SymbolicXYTensor():
 
             self.data = pd.DataFrame(pd.Series(np.zeros(self.size), index = multindex), columns = ['data'] )
             
-        def fill_from_function(self, function, var_dict, position):
+        def fill_from_function(self, function, var_dict, position, taylor = True):
             def row_func(row):
                 partials = row.name # a tuple
                 temp = function # will be differentiating
@@ -206,12 +205,55 @@ class SymbolicXYTensor():
                     temp = temp.diff(var_dict[partial])
                     #lprint(temp)
                 return temp # this is used when we know will be a constant
+
+            def row_func_taylor(row, xy_order):
+                partials = [var_dict[i] for i in row.name] # unpack to true names
+                #print(partials)
+                indices = tuple([partials.count(symbolic_expression(var)) for var in function.variables()]) # change data type so this works
+                if sum(indices) < len(partials):
+                    # there will be a variable not in the polynomial so this's derivative goes to zero
+                    return 0
+                #print(indices)
+                coeff = function[indices]
+                #print(coeff)
+                scale = Integer(np.prod([factorial(i) for i in indices]))/Integer((factorial(self.xy_order.count('X'))*factorial(self.xy_order.count('Y'))))
+                #print(scale)
+                # here we have assumed that the function given is the Taylor poly so multiply by the factorial that was introduced
+                return coeff*scale*factorial(sum(indices))
+
+            def row_func_taylor_1var(row, xy_order):
+                partials = [var_dict[i] for i in row.name] # unpack to true names
+                #print(partials)
+                index = partials.count(symbolic_expression(function.variables()[0]))
+                if len(partials) > index:
+                    # same idea as befoe
+                    return 0
+                #print(indices)
+                coeff = function.coefficients(sparse = False)[index]*factorial(index) # undo what happened during the taylor expansion
+                # no scaling since only one way to get here in the tensor
+                return coeff
+
             
-            if position is None:
+            #if position is None:
                 # bit hacky
-                self.data['data'] = self.data.apply(row_func_no_eval, axis = 1)
+                #self.data['data'] = self.data.apply(row_func_no_eval, axis = 1)
+            #else:
+            if function.variables() is ():
+                # things go wrong if the zero polynomial is passed, this caters for that
+                # aready have all zeros in the dataframe so just return
+                return 
+
+
+            if taylor == True:
+                if len(function.variables()) == 1:
+                    self.data['data'] = self.data.apply(row_func_taylor_1var, xy_order = self.xy_order, axis = 1) 
+                    # another case where stuff breaks
+                else:
+                    self.data['data'] = self.data.apply(row_func_taylor, xy_order = self.xy_order, axis = 1) 
             else:
-                self.data['data'] = self.data.apply(row_func, axis = 1)
+                self.data['data'] = self.data.apply(row_func, axis = 1) # lets ignore the positionless implementation for now
+
+
             
         def vec_mult(self, vec):
             if len(self.xy_order) == 1:
@@ -254,9 +296,9 @@ class SymbolicXYVectorTensor():
                 self.tensors[i] = SymbolicXYTensor(x_dim, y_dim, xy_order)
                 
                 
-        def fill_from_functions(self, functions, var_dict, position):
+        def fill_from_functions(self, functions, var_dict, position, taylor = True):
             for i in range(0, self.vec_length):
-                self.tensors[i].fill_from_function(functions[i], var_dict, position)
+                self.tensors[i].fill_from_function(functions[i], var_dict, position, taylor = taylor)
                 
         def vec_mult(self, vec):
             #print(self.xy_order)
@@ -299,7 +341,7 @@ class SymbolicXYVectorTensor():
                 
 class TensorDict(dict):
     # upgraded dictionary class that fills in missing elements using the rules
-        def __init__(self, funcs, position, var_dict, x_dim = 2, y_dim = 2, func1 = 'f', func2 = 'h', X = 'X', Y = 'Y'):
+        def __init__(self, funcs, position, var_dict, x_dim = 2, y_dim = 2, func1 = 'f', func2 = 'h', X = 'X', Y = 'Y', starting_order = 3):
             super(TensorDict, self).__init__() # initialise empty dictionary
             
             self.funcs = funcs # list of functions that we will evaluate to get the tensors
@@ -311,20 +353,42 @@ class TensorDict(dict):
             self.func2 = func2
             self.X = X
             self.Y = Y
+            self.current_order = starting_order
+
+            # compute the taylor expansion of the shifted functions once here
+            print('computing Taylor approximaton to {} order for speedup'.format(starting_order))
+            tfuncs = [f(**{str(value) : value + position[str(value)] for key, value in var_dict.items()}) for f in funcs] # could be less opaque
+            tfuncs = [tfunc.taylor(*[(key,0) for key,value in position.items()], starting_order) for tfunc in tfuncs] # now the position is just 0
+            tfuncs = [tfunc.polynomial(SR) for tfunc in tfuncs] # assumes that this is all running in sagemath enviroment
+            self.tfuncs = tfuncs
+
+
             
         def __getitem__(self, key):
             # lookup a tensor, if its not there then build it
             try:
                 return dict.__getitem__(self, key)
             except: # keyerror
-                print('generating ' + key)
+                #print('generating ' + key)
+                if len(key[1:]) > self.current_order:
+                    # our current taylor approximation is too small
+                    print('updating Taylor series')
+                    k = round(self.current_order*1.5) # seems a sensible guess of how much more we need
+                    tfuncs = [f(**{str(value) : value + self.position[str(value)] for key, value in self.var_dict.items()}) for f in self.funcs] # could be less opaque
+                    tfuncs = [tfunc.taylor(*[(key,0) for key,value in self.position.items()], k) for tfunc in tfuncs] # now the position is just 0
+                    tfuncs = [tfunc.polynomial(SR) for tfunc in tfuncs] 
+                    self.tfuncs = tfuncs
+                    self.current_order = k
+
+                
                 tensor = SymbolicXYVectorTensor(x_dim = self.x_dim , y_dim = self.y_dim, xy_order = key[1:], vec_length = self.y_dim)
+
                 # ignore the f/h at the start
                 # this is the case for both derivatives of f,h : _ --> Y
                 
                 if key[0] == self.func1:
                     # just getting values of f_....
-                    tensor.fill_from_functions(self.funcs, self.var_dict, self.position)
+                    tensor.fill_from_functions(self.tfuncs, self.var_dict, self.position)
                 elif key[0] == self.func2:
                     # this is h_kX derivative, not so easy to compute
                     raise(Exception(key + ' not possible, need to add the tensor dict manually'))
@@ -339,7 +403,7 @@ class TensorDict(dict):
 def get_fy_inv(x_dim, y_dim, funcs, var_dict, position):
     # first use the symbolic tensor class to compute the derivative
     A = SymbolicXYVectorTensor(x_dim, y_dim, xy_order = 'Y', vec_length = y_dim)
-    A.fill_from_functions(funcs, var_dict, position)
+    A.fill_from_functions(funcs, var_dict, position, taylor=True)
     
     # now extract and arrange in the format of a sage matrix
     # each element in the tensor list will correspond to a row in the matrix
@@ -347,6 +411,8 @@ def get_fy_inv(x_dim, y_dim, funcs, var_dict, position):
     row_list = []
     for index in A.tensors:
         row_list.append(A.tensors[index].data['data'].to_list())
+
+    print(matrix(row_list))
         
     return matrix(row_list).inverse()            
                                
@@ -390,19 +456,39 @@ def block_to_polynomial(y_dim, e_block, x_var_keys, var_dict, tensor_dict):
         ei_vecs['e' + str(i)] = [int(i == j) for j in range(1, len(x_var_keys) + 1)]
         link_dict['e' + str(i)] = 'x' + str(i)
     
-    # compute each term and add to out
-    for combo in itertools.product(list(ei_vecs.keys()), repeat = order):
+    # Old slow method
+    #for combo in itertools.product(list(ei_vecs.keys()), repeat = order):
         #print([ei_vecs[key] for key in combo])
-        # TODO - exploit symmetry for speedup
+        #coeffs = evaluate(e_block, [ei_vecs[key] for key in combo], tensor_dict) # evaluate at this combo of basis vectors
+        #term = prod([var_dict[link_dict[ei_key]] for ei_key in combo]) # xi*xj*xk^2 etc
+        
+        #out = [a + b*term for a, b in zip(out, coeffs)] # update the output list
+
+    for combo in itertools.combinations_with_replacement(list(ei_vecs.keys()), r = order):
+        # now used symmetry - should be a pretty strong speed up
+        #print([ei_vecs[key] for key in combo])
         coeffs = evaluate(e_block, [ei_vecs[key] for key in combo], tensor_dict) # evaluate at this combo of basis vectors
         term = prod([var_dict[link_dict[ei_key]] for ei_key in combo]) # xi*xj*xk^2 etc
-        
-        out = [a + b*term for a, b in zip(out, coeffs)] # update the output list
+        scale = Integer(factorial(order) / prod([factorial(combo.count(item)) for item in set(combo)]))
+        out = [a + scale*b*term for a, b in zip(out, coeffs)] # update the output list
         
     return out    
     
-def get_hkx_polynomial(funcs, k, x_dim, y_dim, var_dict, x_var_keys, tensor_dict, position):
+def get_hkx_polynomial(funcs, k, x_dim, y_dim, var_dict, x_var_keys, tensor_dict, position, taylor = None):
     # note doesn't support constant c yet - but this doesn't appear so we are good
+    
+    #if taylor is None:
+        # the rest of the function will draw from the coefficients in the Taylor polynomial we compute
+        # first redefine the functions so are at zero
+        #tfuncs = [f(**{str(value) : value + position[str(value)] for key, value in var_dict.items()}) for f in funcs] # could be less opaque
+        #tfuncs = [tfunc.taylor(*[(key,0) for key,value in position.items()], k) for tfunc in tfuncs] # now the position is just 0
+        #print('Taylor series calcuated')
+    #else:
+        #tfuncs = taylor
+
+    tfuncs = tensor_dict.tfuncs
+
+    # it doesn't actually matter that these have the wrong variables, all we care about is the coefficients
     
     if position != tensor_dict.position:
         raise(Exception('tensor dict position does not match position given'))
@@ -414,19 +500,22 @@ def get_hkx_polynomial(funcs, k, x_dim, y_dim, var_dict, x_var_keys, tensor_dict
     # inductively compute the lower orders of hkx so they will be added to the tensor dict
     
     out = [0]*y_dim
-    lower_order = get_hkx_polynomial(funcs, k-1, x_dim, y_dim, var_dict, x_var_keys, tensor_dict, position)
-    print(lower_order)
+
+    lower_order = get_hkx_polynomial(tfuncs, k-1, x_dim, y_dim, var_dict, x_var_keys, tensor_dict, position, taylor = tfuncs)
+
+    #print(lower_order)
     
     # now ready to solve for hkx
     # first get the expression we need
     
     b = ExpressionBlock() # defaults to just f
     e = Expression(blocks = [b]) # ready to differentiate
-    for i in range(0,k):
+    #print('preparing the relationships to solve for')
+    for i in tqdm.tqdm(range(0,k)):
         e = e.diff()
         
     # the last block is hkx
-    for block in e.blocks[:-1]:
+    for block in tqdm.tqdm(e.blocks[:-1]):
         #lprint(block)
         new_term = block_to_polynomial(y_dim, block, x_var_keys, var_dict, tensor_dict)
         out = [a + b/factorial(k) for a, b in zip(out, new_term)] # update the output list 
@@ -435,12 +524,13 @@ def get_hkx_polynomial(funcs, k, x_dim, y_dim, var_dict, x_var_keys, tensor_dict
         # TODO - is the factorial correct?
         
     # multiply by fyinv
-    A = get_fy_inv(x_dim, y_dim, funcs, var_dict, position)
+    A = get_fy_inv(x_dim, y_dim, tfuncs, var_dict, position)
     out = list(-A*vector(out)) # using the derived formula
-    
+
+    #print([f.polynomial(SR).variables() for f in out])
     # now convert to a tensor
     tensor = SymbolicXYVectorTensor(x_dim = x_dim , y_dim = y_dim, xy_order = 'X'*k, vec_length = y_dim)
-    tensor.fill_from_functions(out, var_dict, position) # so avoids messy function evaluation
+    tensor.fill_from_functions([f.polynomial(SR) for f in out], var_dict, position) # so avoids messy function evaluation
     tensor_dict['h' + 'X'*k] = tensor
     
     
