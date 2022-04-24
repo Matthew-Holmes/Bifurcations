@@ -1,20 +1,22 @@
-# implicit.py 
+# Contents
+
+### implicit.py 
 contains the computational implementation of the implicit function theorem
 
-# Implicit Testing.ipynb 
+### Implicit Testing.ipynb 
 tests that it works correctly
 
-# Crandall-Rabinowitz.ipynb
+### Crandall-Rabinowitz.ipynb
 shows how we can use the theorem to find bifurcation points
 
-# ElasticRodCompBifs.ipynb
+### ElasticRodCompBifs.ipynb
 explores the bifurcation points of a discrete elastic rod model
 
-# ElasticRodMaxLen.ipynm 
+### ElasticRodMaxLen.ipynm 
 investigates how large we can make the problem before it becomes computationally intractable
 
-# ElasticRodGravity2.ipynm 
+### ElasticRodGravity2.ipynm 
 explores how including gravity affects the bifurcations points when the force has magnitude 2
 
-# ElasticRodGravity6.ipynm 
+### ElasticRodGravity6.ipynm 
 explores how including gravity affects the bifurcations points when the force has magnitude 6
